@@ -8,7 +8,6 @@ https://github.com/user-attachments/assets/71ac87fb-e52a-41bc-911d-84bb94758245
 
 
 
-
 ### Features:
 - Clipboard cleanup
 - Starring/favourites
