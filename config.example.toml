@@ -1,0 +1,40 @@
+# Example configuration for memoria-daemon
+#
+# Location expected by the daemon:
+#   ~/.config/memoria/config.toml
+#
+# Note: most fields are REQUIRED. If a field is missing, the daemon will fail
+# to start with “failed to parse config TOML”.
+
+[retention]
+# Delete items older than this many days.
+days = 30
+# If true, retention cleanup only deletes *unstarred* items.
+# Starred items are kept indefinitely.
+delete_unstarred_only = true
+
+[ui]
+# UI window size.
+width = 480
+height = 640
+
+# UI placement hint. Currently treated as a string by the daemon/config layer.
+# (Interpretation is up to the UI.)
+# Suggested values: "top-right", "top-left", "bottom-right", "bottom-left"
+anchor = "top-right"
+
+# Window opacity, 0.0 - 1.0
+opacity = 0.92
+
+# Background blur amount (float). Interpretation depends on UI/platform.
+blur = 12.0
+
+[grid]
+# Thumbnail size in pixels.
+thumb_size = 96
+# Number of columns in the grid.
+columns = 3
+
+[behavior]
+# If true, avoid storing duplicates (implementation-dependent).
+dedupe = true

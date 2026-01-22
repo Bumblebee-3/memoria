@@ -1,0 +1,25 @@
+[Unit]
+Description=memoria Daemon
+Documentation=https://github.com/Bumblebee-3/memoria
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/memoria-daemon
+Environment="RUST_LOG=info"
+Restart=on-failure
+RestartSec=5s
+
+# Graceful shutdown: gives the daemon time to clean up the socket and close
+# the database cleanly via SIGTERM.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Hardening (optional but recommended).
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target
