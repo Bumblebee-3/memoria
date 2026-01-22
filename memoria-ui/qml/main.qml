@@ -535,6 +535,27 @@ ApplicationWindow {
         }
     }
 
+    // 's' key: star/unstar selected or current item
+    Shortcut {
+        sequence: "s"
+        enabled: !searchField.activeFocus && viewMode === "list" && contentList.activeFocus && contentList.currentIndex >= 0
+        onActivated: {
+            let item = listModel.get(contentList.currentIndex)
+            ipcClient.star(item.clipId, !item.starred)
+            item.starred = !item.starred
+        }
+    }
+
+    Shortcut {
+        sequence: "s"
+        enabled: !searchField.activeFocus && viewMode === "gallery" && contentGrid.activeFocus && contentGrid.currentIndex >= 0
+        onActivated: {
+            let item = galleryModel.get(contentGrid.currentIndex)
+            ipcClient.star(item.clipId, !item.starred)
+            item.starred = !item.starred
+        }
+    }
+
 
     ColumnLayout {
         anchors.fill: parent

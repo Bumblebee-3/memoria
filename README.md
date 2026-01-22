@@ -16,7 +16,7 @@
 - image previews
 - searching
 - keyboard navigation
-    arrow keys to navigate, / to search, enter to select and esc to close
+    arrow keys to navigate, / to search, enter to select and esc to close, del to delete and s to star.
 
 
 
