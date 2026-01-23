@@ -212,61 +212,77 @@ async fn dispatch_request(
     cfg: &Arc<crate::config::Config>,
     req: IpcRequest,
 ) -> Result<IpcResponse<serde_json::Value>> {
-    match req {
+    let result = match req {
         IpcRequest::List { limit, starred_only } => {
-            let rows = list_items(conn, limit.unwrap_or(50), starred_only).await?;
-            Ok(IpcResponse::ok(serde_json::to_value(rows)?))
+            match list_items(conn, limit.unwrap_or(50), starred_only).await {
+                Ok(rows) => IpcResponse::ok(serde_json::to_value(rows)?),
+                Err(e) => IpcResponse::err(format!("Failed to list items: {}", e)),
+            }
         }
         IpcRequest::Search { query, limit } => {
-            let rows = search_items(conn, &query, limit.unwrap_or(50)).await?;
-            Ok(IpcResponse::ok(serde_json::to_value(rows)?))
+            match search_items(conn, &query, limit.unwrap_or(50)).await {
+                Ok(rows) => IpcResponse::ok(serde_json::to_value(rows)?),
+                Err(e) => IpcResponse::err(format!("Failed to search items: {}", e)),
+            }
         }
         IpcRequest::Gallery { limit } => {
-            let rows = gallery_items(conn, limit.unwrap_or(50)).await?;
-            Ok(IpcResponse::ok(serde_json::to_value(rows)?))
+            match gallery_items(conn, limit.unwrap_or(50)).await {
+                Ok(rows) => IpcResponse::ok(serde_json::to_value(rows)?),
+                Err(e) => IpcResponse::err(format!("Failed to fetch gallery: {}", e)),
+            }
         }
         IpcRequest::Star { id, value } => {
-            let updated = star_item(conn, id, value).await?;
-            Ok(IpcResponse::ok(serde_json::json!({"updated": updated})))
+            match star_item(conn, id, value).await {
+                Ok(updated) => IpcResponse::ok(serde_json::json!({"updated": updated})),
+                Err(e) => IpcResponse::err(format!("Failed to star item {}: {}", id, e)),
+            }
         }
         IpcRequest::Copy { id } => {
-            copy_to_clipboard(conn, id).await?;
-            Ok(IpcResponse::ok(serde_json::json!({"copied": true})))
+            match copy_to_clipboard(conn, id).await {
+                Ok(_) => IpcResponse::ok(serde_json::json!({"copied": true})),
+                Err(e) => IpcResponse::err(format!("Failed to copy item {}: {}", id, e)),
+            }
         }
         IpcRequest::Delete { ids } => {
-            let deleted = delete_items(conn, ids).await?;
-            Ok(IpcResponse::ok(serde_json::json!({"deleted": deleted})))
+            match delete_items(conn, ids.clone()).await {
+                Ok(deleted) => IpcResponse::ok(serde_json::json!({"deleted": deleted})),
+                Err(e) => IpcResponse::err(format!("Failed to delete items: {}", e)),
+            }
         }
         IpcRequest::DeleteAllExceptStarred => {
-            let result = delete_all_except_starred(conn).await?;
-            Ok(IpcResponse::ok(serde_json::json!({
-                "deleted_items": result.deleted_items,
-                "deleted_images": result.deleted_images
-            })))
+            match delete_all_except_starred(conn).await {
+                Ok(result) => IpcResponse::ok(serde_json::json!({
+                    "deleted_items": result.deleted_items,
+                    "deleted_images": result.deleted_images
+                })),
+                Err(e) => IpcResponse::err(format!("Failed to delete all except starred: {}", e)),
+            }
         }
         IpcRequest::DeleteItems { ids } => {
             let conn = conn.clone();
-            let deleted_count = tokio::task::spawn_blocking(move || {
+            let ids_clone = ids.clone();
+            match tokio::task::spawn_blocking(move || {
                 let conn = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
                 let mut count: i64 = 0;
-                for id in ids {
+                for id in ids_clone {
                     match crate::retention::delete_item_and_files(&conn, id) {
                         Ok(_) => { count += 1; },
                         Err(err) => {
-                            // Log and continue to attempt other deletions
                             tracing::warn!(error=%err, item_id=id, "failed to delete item by id");
                         }
                     }
                 }
                 Ok::<i64, anyhow::Error>(count)
-            }).await??;
-
-            Ok(IpcResponse::ok(serde_json::json!({
-                "deleted_count": deleted_count
-            })))
+            }).await {
+                Ok(Ok(deleted_count)) => IpcResponse::ok(serde_json::json!({
+                    "deleted_count": deleted_count
+                })),
+                Ok(Err(e)) => IpcResponse::err(format!("Failed to delete items: {}", e)),
+                Err(e) => IpcResponse::err(format!("Task failed: {}", e)),
+            }
         }
         IpcRequest::GetSettings => {
-            Ok(IpcResponse::ok(serde_json::json!({
+            IpcResponse::ok(serde_json::json!({
                 "ui": {
                     "width": cfg.ui.width,
                     "height": cfg.ui.height,
@@ -281,9 +297,11 @@ async fn dispatch_request(
                 "behavior": {
                     "dedupe": cfg.behavior.dedupe
                 }
-            })))
+            }))
         }
-    }
+    };
+
+    Ok(result)
 }
 
 struct DeleteAllResult {
@@ -496,6 +514,15 @@ async fn star_item(conn: &Arc<Mutex<rusqlite::Connection>>, id: i64, value: bool
 }
 
 async fn copy_to_clipboard(conn: &Arc<Mutex<rusqlite::Connection>>, id: i64) -> Result<()> {
+    // Check if wl-copy is available
+    if let Err(_) = tokio::process::Command::new("which")
+        .arg("wl-copy")
+        .output()
+        .await
+    {
+        return Err(anyhow!("wl-copy not found - install wl-clipboard package"));
+    }
+
     // Fetch item and possible image bytes.
     let conn = conn.clone();
     let item = tokio::task::spawn_blocking(move || {
@@ -527,9 +554,10 @@ async fn copy_to_clipboard(conn: &Arc<Mutex<rusqlite::Connection>>, id: i64) -> 
             return Ok(CopyPayload::Text { body });
         }
 
-        Err(anyhow!("item not found"))
+        Err(anyhow!("item with id {} not found", id))
     })
-    .await??;
+    .await
+    .map_err(|e| anyhow!("database task failed: {}", e))??;
 
     match item {
         CopyPayload::Image { mime, bytes } => {
@@ -537,6 +565,7 @@ async fn copy_to_clipboard(conn: &Arc<Mutex<rusqlite::Connection>>, id: i64) -> 
                 .arg("-t")
                 .arg(&mime)
                 .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .spawn()
                 .context("failed to spawn wl-copy for image")?;
 
@@ -544,17 +573,20 @@ async fn copy_to_clipboard(conn: &Arc<Mutex<rusqlite::Connection>>, id: i64) -> 
                 stdin
                     .write_all(&bytes)
                     .await
-                    .context("failed to write to wl-copy")?;
+                    .context("failed to write image data to wl-copy")?;
+                drop(stdin); // Explicitly close stdin
             }
 
-            let status = child.wait().await.context("failed to wait on wl-copy")?;
-            if !status.success() {
-                return Err(anyhow!("wl-copy failed"));
+            let output = child.wait_with_output().await.context("failed to wait on wl-copy")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow!("wl-copy failed: {}", stderr));
             }
         }
         CopyPayload::Text { body } => {
             let mut child = Command::new("wl-copy")
                 .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .spawn()
                 .context("failed to spawn wl-copy for text")?;
 
@@ -562,12 +594,14 @@ async fn copy_to_clipboard(conn: &Arc<Mutex<rusqlite::Connection>>, id: i64) -> 
                 stdin
                     .write_all(body.as_bytes())
                     .await
-                    .context("failed to write to wl-copy")?;
+                    .context("failed to write text data to wl-copy")?;
+                drop(stdin); // Explicitly close stdin
             }
 
-            let status = child.wait().await.context("failed to wait on wl-copy")?;
-            if !status.success() {
-                return Err(anyhow!("wl-copy failed"));
+            let output = child.wait_with_output().await.context("failed to wait on wl-copy")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow!("wl-copy failed: {}", stderr));
             }
         }
     }

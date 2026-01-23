@@ -40,7 +40,7 @@ void IpcClient::connectToDaemon()
 void IpcClient::sendRequest(const QJsonObject &request)
 {
     if (m_socket->state() != QLocalSocket::ConnectedState) {
-        emit error("Not connected to daemon");
+        emit error("Not connected to daemon. Is memoria-daemon running?");
         return;
     }
 
@@ -49,7 +49,7 @@ void IpcClient::sendRequest(const QJsonObject &request)
     
     qint64 written = m_socket->write(data);
     if (written == -1) {
-        emit error("Failed to send request");
+        emit error("Failed to send request to daemon");
         return;
     }
     
@@ -182,6 +182,7 @@ void IpcClient::onReadyRead()
         QJsonDocument doc = QJsonDocument::fromJson(line.toUtf8());
         if (doc.isNull() || !doc.isObject()) {
             qWarning() << "Invalid JSON response:" << line;
+            emit error("Received malformed response from daemon");
             continue;
         }
         
@@ -189,7 +190,8 @@ void IpcClient::onReadyRead()
         bool ok = response["ok"].toBool();
         
         if (!ok) {
-            QString errorMsg = response["error"].toString("Unknown error");
+            QString errorMsg = response["error"].toString("Unknown daemon error");
+            qWarning() << "Daemon error:" << errorMsg;
             emit error(errorMsg);
             continue;
         }
@@ -254,16 +256,25 @@ void IpcClient::onError(QLocalSocket::LocalSocketError socketError)
     QString errorMsg;
     switch (socketError) {
     case QLocalSocket::ServerNotFoundError:
-        errorMsg = "Daemon not running or socket not found";
+        errorMsg = "Daemon socket not found. Start memoria-daemon first.";
         break;
     case QLocalSocket::ConnectionRefusedError:
-        errorMsg = "Connection refused";
+        errorMsg = "Connection refused. Is memoria-daemon running?";
+        break;
+    case QLocalSocket::SocketAccessError:
+        errorMsg = "Permission denied accessing daemon socket";
+        break;
+    case QLocalSocket::SocketResourceError:
+        errorMsg = "System resource error communicating with daemon";
+        break;
+    case QLocalSocket::SocketTimeoutError:
+        errorMsg = "Daemon connection timeout";
         break;
     default:
-        errorMsg = m_socket->errorString();
+        errorMsg = QString("Socket error: %1").arg(m_socket->errorString());
         break;
     }
     
-    qWarning() << "Socket error:" << errorMsg;
+    qWarning() << "Socket error:" << socketError << "-" << errorMsg;
     emit error(errorMsg);
 }

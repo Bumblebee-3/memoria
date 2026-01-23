@@ -10,29 +10,55 @@ use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 
-/// Main daemon entrypoint.
-///
-/// Responsibilities:
-/// - Load config from `~/.config/memoria/config.toml`
-/// - Ensure data directory `~/.local/share/memoria/`
-/// - Initialize SQLite at `~/.local/share/memoria/memoria.db`
-/// - Bind a Unix domain socket at `/run/user/$UID/memoria.sock`
-/// - Accept connections (no protocol/commands yet)
-/// - Graceful shutdown on SIGTERM
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
-    let cfg_path = config::default_config_path()?;
-    let cfg = config::load_from_file(&cfg_path)?;
-    info!(path=%cfg_path.display(), "loaded config");
-    info!(retention_days=cfg.retention.days, "config: retention");
+    // Load or create config with defaults
+    let cfg_path = config::default_config_path()
+        .context("FAILED TO RESOLVE CONFIG PATH")?;
+    
+    let cfg = match config::load_or_default(&cfg_path) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            // Print a clear error message and exit
+            eprintln!("\n❌ CONFIGURATION ERROR\n");
+            eprintln!("Failed to load config from: {}", cfg_path.display());
+            eprintln!("Error: {}\n", err);
+            eprintln!("Please check your config file syntax or delete it to regenerate defaults.\n");
+            std::process::exit(1);
+        }
+    };
+    
+    info!(path=%cfg_path.display(), "config loaded");
+    info!(retention_days=cfg.retention.days, delete_unstarred_only=cfg.retention.delete_unstarred_only, "retention policy");
+    info!(dedupe=cfg.behavior.dedupe, "behavior settings");
 
-    let data_dir = db::default_data_dir()?;
-    db::ensure_data_dir(&data_dir)?;
+    let data_dir = db::default_data_dir()
+        .context("FAILED TO RESOLVE DATA DIRECTORY")?;
+    
+    if let Err(err) = db::ensure_data_dir(&data_dir) {
+        eprintln!("\n❌ DATA DIRECTORY ERROR\n");
+        eprintln!("Failed to create data directory: {}", data_dir.display());
+        eprintln!("Error: {}\n", err);
+        eprintln!("Check file permissions and disk space.\n");
+        std::process::exit(1);
+    }
 
-    let db_path = db::default_db_path()?;
-    let conn = db::open_and_init(&db_path)?;
+    let db_path = db::default_db_path()
+        .context("FAILED TO RESOLVE DATABASE PATH")?;
+    
+    let conn = match db::open_and_init(&db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("\n❌ DATABASE ERROR\n");
+            eprintln!("Failed to initialize database: {}", db_path.display());
+            eprintln!("Error: {}\n", err);
+            eprintln!("The database file may be corrupted. Try deleting it to start fresh.\n");
+            std::process::exit(1);
+        }
+    };
+    
     let conn = std::sync::Arc::new(std::sync::Mutex::new(conn));
     info!(db=%db_path.display(), "database ready");
 
@@ -49,8 +75,28 @@ async fn main() -> Result<()> {
     // Store config in Arc for IPC access.
     let cfg_arc = std::sync::Arc::new(cfg);
 
-    let sock_path = runtime_socket_path().context("failed to build runtime socket path")?;
-    let listener = bind_unix_socket(&sock_path)?;
+    let sock_path = match runtime_socket_path() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("\n❌ SOCKET PATH ERROR\n");
+            eprintln!("Failed to determine runtime socket path.");
+            eprintln!("Error: {}\n", err);
+            eprintln!("Ensure XDG_RUNTIME_DIR is set or /run/user/$UID exists.\n");
+            std::process::exit(1);
+        }
+    };
+    
+    let listener = match bind_unix_socket(&sock_path) {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("\n❌ SOCKET BIND ERROR\n");
+            eprintln!("Failed to bind Unix socket: {}", sock_path.display());
+            eprintln!("Error: {}\n", err);
+            eprintln!("Another instance may be running, or check file permissions.\n");
+            std::process::exit(1);
+        }
+    };
+    
     info!(socket=%sock_path.display(), "listening");
 
     run_server(listener, sock_path, conn.clone(), cfg_arc).await

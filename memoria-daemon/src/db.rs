@@ -27,14 +27,25 @@ pub fn ensure_data_dir(dir: &Path) -> Result<()> {
 /// - `images` table
 /// - `items_fts` FTS5 virtual table for text search
 pub fn open_and_init(db_path: &Path) -> Result<Connection> {
+    // Check if parent directory is writable
+    if let Some(parent) = db_path.parent() {
+        if parent.exists() {
+            let metadata = std::fs::metadata(parent)
+                .context("failed to check data directory permissions")?;
+            if metadata.permissions().readonly() {
+                anyhow::bail!("Data directory is read-only: {}", parent.display());
+            }
+        }
+    }
+
     let conn = Connection::open(db_path)
-        .with_context(|| format!("failed to open db: {}", db_path.display()))?;
+        .with_context(|| format!("failed to open database: {}", db_path.display()))?;
 
     // Pragmas are applied per-connection.
     conn.pragma_update(None, "foreign_keys", "ON")
-        .context("failed to enable foreign_keys")?;
+        .context("failed to enable foreign_keys pragma")?;
     conn.pragma_update(None, "journal_mode", "WAL")
-        .context("failed to enable WAL")?;
+        .context("failed to enable WAL mode")?;
 
     // Schema: kept intentionally minimal but extensible.
     conn.execute_batch(
@@ -83,10 +94,11 @@ pub fn open_and_init(db_path: &Path) -> Result<Connection> {
         END;
         "#,
     )
-    .context("failed to initialize schema")?;
+    .context("failed to initialize database schema - database may be corrupted")?;
 
     // A tiny no-op sanity query to ensure the connection is usable.
-    let _: i64 = conn.query_row("SELECT 1", params![], |row| row.get(0))?;
+    let _: i64 = conn.query_row("SELECT 1", params![], |row| row.get(0))
+        .context("database connection sanity check failed")?;
 
     Ok(conn)
 }

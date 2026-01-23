@@ -1,10 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncBufReadExt;
-use tokio::process::{Child, Command};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use tracing::{debug, error, info, warn};
 use image::GenericImageView;
 use rusqlite::OptionalExtension;
@@ -55,166 +53,126 @@ fn compute_hash(data: &[u8]) -> String {
 
 /// Start the clipboard watcher.
 ///
-/// This spawns a background task that:
-/// 1. Runs `wl-paste --watch` to monitor clipboard changes
-/// 2. Detects MIME types for each entry
-/// 3. Computes SHA-256 hashes
-/// 4. Stores or deduplicates in the database
-/// 5. Handles image thumbnails
-/// 6. Auto-restarts on crash
+/// This spawns a background task that uses polling to detect clipboard changes:
+/// 1. Polls clipboard every 300ms via wl-paste (no --watch)
+/// 2. Computes SHA-256 hash of content
+/// 3. Detects changes by comparing hashes
+/// 4. Processes new clipboard entries
+/// 5. Handles both text and images
+/// 6. Auto-recovers from transient errors
+///
+/// This approach is robust because:
+/// - No process churn or exec weirdness
+/// - Works everywhere wl-paste works
+/// - Handles race conditions via deduplication
+/// - Graceful recovery from failures
 pub async fn start_watcher(conn: Arc<Mutex<rusqlite::Connection>>, cfg: crate::config::Config) {
     tokio::spawn(async move {
+        // Check prerequisites before starting
+        if let Err(e) = check_prerequisites().await {
+            error!("FATAL: {}", e);
+            error!("Clipboard monitoring disabled");
+            return;
+        }
+
+        info!("clipboard watcher started (polling every 300ms)");
+
+        let mut last_text_hash: Option<String> = None;
+        let mut last_image_hash: Option<String> = None;
+        let poll_interval = Duration::from_millis(300);
+
         loop {
-            if let Err(err) = run_clipboard_watcher(conn.clone(), cfg.clone()).await {
-                error!(error=%err, "clipboard watcher crashed, restarting in 5s");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(poll_interval).await;
+
+            // Poll text clipboard
+            match poll_clipboard("text/plain").await {
+                Ok(data) if !data.is_empty() => {
+                    let hash = compute_hash(&data);
+                    if last_text_hash.as_ref() != Some(&hash) {
+                        debug!(hash=%hash, "text clipboard changed");
+                        last_text_hash = Some(hash.clone());
+
+                        let entry = ClipboardEntry::new("text/plain".to_string(), data);
+                        if let Err(err) = process_entry(&conn, entry, cfg.behavior.dedupe).await {
+                            warn!(error=%err, "failed to process text clipboard entry");
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // Empty clipboard, reset hash
+                    last_text_hash = None;
+                }
+                Err(err) => {
+                    debug!(error=%err, "failed to poll text clipboard");
+                }
+            }
+
+            // Poll image clipboard
+            match poll_clipboard("image/png").await {
+                Ok(data) if !data.is_empty() => {
+                    let hash = compute_hash(&data);
+                    if last_image_hash.as_ref() != Some(&hash) {
+                        debug!(hash=%hash, "image clipboard changed");
+                        last_image_hash = Some(hash.clone());
+
+                        let entry = ClipboardEntry::new("image/png".to_string(), data);
+                        if let Err(err) = process_entry(&conn, entry, cfg.behavior.dedupe).await {
+                            warn!(error=%err, "failed to process image clipboard entry");
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // Empty clipboard, reset hash
+                    last_image_hash = None;
+                }
+                Err(err) => {
+                    debug!(error=%err, "failed to poll image clipboard");
+                }
             }
         }
     });
 }
 
-/// Main clipboard watcher loop.
-///
-/// Uses `wl-paste --watch` to detect clipboard changes and process them.
-async fn run_clipboard_watcher(
-    conn: Arc<Mutex<rusqlite::Connection>>,
-    cfg: crate::config::Config,
-) -> Result<()> {
-    // We use a subprocess approach:
-    // `wl-paste --watch` outputs available MIME types on each change,
-    // one per line, then a blank line to signal completion.
-    let mut child = spawn_wl_paste_watch()?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .context("failed to get stdout from wl-paste")?;
-
-    let reader = tokio::io::BufReader::new(stdout);
-    let mut lines = reader.lines();
-
-    while let Some(line) = lines.next_line().await? {
-        let line = line.trim();
-
-        // Blank line signals end of MIME list for this clipboard change.
-        if line.is_empty() {
-            debug!("clipboard change detected, processing");
-
-            // Try to fetch the best available MIME type.
-            if let Err(err) = process_clipboard_entry(&conn, &cfg).await {
-                warn!(error=%err, "failed to process clipboard entry");
-            }
-            continue;
-        }
-
-        // Lines are MIME type strings; we'll handle them in process_clipboard_entry.
-        debug!(mime=%line, "clipboard MIME type available");
+/// Check prerequisites for clipboard monitoring.
+async fn check_prerequisites() -> Result<()> {
+    // Check if wl-paste is available
+    match tokio::process::Command::new("which")
+        .arg("wl-paste")
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {}
+        _ => return Err(anyhow::anyhow!("wl-paste not found in PATH - install wl-clipboard package")),
     }
 
-    // If we get here, wl-paste exited. Return an error to trigger a restart.
-    bail!("wl-paste process exited unexpectedly")
-}
-
-/// Spawn the `wl-paste --watch` subprocess.
-fn spawn_wl_paste_watch() -> Result<Child> {
-    Command::new("wl-paste")
-        .arg("--watch")
-        .arg("echo")
-        .arg("")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to spawn wl-paste --watch")
-}
-
-/// Process a clipboard entry by fetching available MIME types and the best content.
-async fn process_clipboard_entry(
-    conn: &Arc<Mutex<rusqlite::Connection>>,
-    cfg: &crate::config::Config,
-) -> Result<()> {
-    // Query available MIME types.
-    let mimes = query_available_mimes().await?;
-    if mimes.is_empty() {
-        debug!("no MIME types available in clipboard");
-        return Ok(());
+    // Check if Wayland is available
+    if std::env::var("WAYLAND_DISPLAY").is_err() {
+        return Err(anyhow::anyhow!("WAYLAND_DISPLAY not set - not running under Wayland"));
     }
-
-    debug!(mime_types=?mimes, "available MIME types");
-
-    // Prefer image, then text/plain, then first available.
-    let preferred_mime = choose_best_mime(&mimes);
-    debug!(selected_mime=%preferred_mime, "selected MIME type");
-
-    // Fetch clipboard content.
-    let data = fetch_clipboard_data(&preferred_mime).await?;
-    if data.is_empty() {
-        debug!(mime=%preferred_mime, "clipboard content is empty");
-        return Ok(());
-    }
-
-    let entry = ClipboardEntry::new(preferred_mime, data);
-    debug!(hash=%entry.hash, mime=%entry.mime, size=entry.data.len(), "clipboard entry ready");
-
-    // Process the entry: insert or dedupe (if dedupe enabled).
-    process_entry(conn, entry, cfg.behavior.dedupe).await?;
 
     Ok(())
 }
 
-/// Query available MIME types using `wl-paste -l`.
-async fn query_available_mimes() -> Result<Vec<String>> {
-    let output = tokio::process::Command::new("wl-paste")
-        .arg("-l")
-        .output()
-        .await
-        .context("failed to run wl-paste -l")?;
-
-    if !output.status.success() {
-        bail!("wl-paste -l failed");
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mimes: Vec<String> = text.lines().map(|s| s.to_string()).collect();
-
-    Ok(mimes)
-}
-
-/// Choose the best MIME type from available options.
-/// Prioritizes images, then text/plain, then the first available.
-fn choose_best_mime(mimes: &[String]) -> String {
-    // Prefer image types.
-    for mime in mimes {
-        if mime.starts_with("image/") {
-            return mime.clone();
-        }
-    }
-
-    // Then prefer text/plain.
-    for mime in mimes {
-        if mime == "text/plain" {
-            return mime.clone();
-        }
-    }
-
-    // Fall back to first available.
-    mimes.first().cloned().unwrap_or_else(|| "text/plain".to_string())
-}
-
-/// Fetch clipboard content for a specific MIME type.
-async fn fetch_clipboard_data(mime: &str) -> Result<Vec<u8>> {
+/// Poll clipboard for a specific MIME type.
+/// Returns the clipboard data if available and non-empty, otherwise empty vec.
+async fn poll_clipboard(mime: &str) -> Result<Vec<u8>> {
     let output = tokio::process::Command::new("wl-paste")
         .arg("-t")
         .arg(mime)
         .output()
         .await
-        .context("failed to run wl-paste")?;
+        .context(format!("failed to run wl-paste for {}", mime))?;
 
     if !output.status.success() {
-        bail!("wl-paste failed for MIME type: {}", mime);
+        // Status error is not fatal - just no clipboard data for this type
+        return Ok(Vec::new());
     }
 
     Ok(output.stdout)
 }
+
+/// Main clipboard watcher loop (removed - using polling instead).
+/// See start_watcher() for polling-based implementation.
 
 /// Process a clipboard entry: check for duplicates if enabled, insert or update.
 async fn process_entry(
