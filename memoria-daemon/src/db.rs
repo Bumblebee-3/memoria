@@ -2,32 +2,22 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 
-/// Resolve the data directory: `~/.local/share/memoria/`.
 pub fn default_data_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("could not resolve home directory")?;
     Ok(home.join(".local/share/memoria"))
 }
 
-/// Resolve the database path: `~/.local/share/memoria/memoria.db`.
 pub fn default_db_path() -> Result<PathBuf> {
     Ok(default_data_dir()?.join("memoria.db"))
 }
 
-/// Ensures the data directory exists.
 pub fn ensure_data_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create data dir: {}", dir.display()))?;
     Ok(())
 }
 
-/// Open the SQLite database (creating it if missing) and run schema migrations.
-///
-/// Uses `rusqlite` and enables basic pragmas. The schema includes:
-/// - `items` table
-/// - `images` table
-/// - `items_fts` FTS5 virtual table for text search
 pub fn open_and_init(db_path: &Path) -> Result<Connection> {
-    // Check if parent directory is writable
     if let Some(parent) = db_path.parent() {
         if parent.exists() {
             let metadata = std::fs::metadata(parent)
@@ -41,13 +31,11 @@ pub fn open_and_init(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("failed to open database: {}", db_path.display()))?;
 
-    // Pragmas are applied per-connection.
     conn.pragma_update(None, "foreign_keys", "ON")
         .context("failed to enable foreign_keys pragma")?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .context("failed to enable WAL mode")?;
 
-    // Schema: kept intentionally minimal but extensible.
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS items (
@@ -96,7 +84,6 @@ pub fn open_and_init(db_path: &Path) -> Result<Connection> {
     )
     .context("failed to initialize database schema - database may be corrupted")?;
 
-    // A tiny no-op sanity query to ensure the connection is usable.
     let _: i64 = conn.query_row("SELECT 1", params![], |row| row.get(0))
         .context("database connection sanity check failed")?;
 

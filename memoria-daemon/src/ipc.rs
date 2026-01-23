@@ -11,24 +11,15 @@ use tracing::{error};
 
 #[derive(Debug)]
 pub enum IpcRequest {
-    /// List recent items, newest first. Optional: filter by starred only.
     List { limit: Option<u32>, starred_only: bool },
-    /// Full-text search.
     Search { query: String, limit: Option<u32> },
-    /// Images only gallery.
     Gallery { limit: Option<u32> },
-    /// Star/unstar an item.
     Star { id: i64, value: bool },
-    /// Restore item to clipboard.
     Copy { id: i64 },
 
-    /// Delete specific items (only non-starred ones; starred items are silently ignored).
     Delete { ids: Vec<i64> },
-    /// Delete all non-starred items (and related images).
     DeleteAllExceptStarred,
-    /// Delete specific items by ID.
     DeleteItems { ids: Vec<i64> },
-    /// Fetch UI, grid, and behavior settings.
     GetSettings,
 }
 
@@ -74,7 +65,6 @@ pub struct ItemSummary {
     pub thumbnail_path: Option<String>,
 }
 
-/// Handle one accepted Unix domain socket connection.
 pub async fn handle_connection(stream: UnixStream, conn: Arc<Mutex<rusqlite::Connection>>, cfg: Arc<crate::config::Config>) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -110,10 +100,6 @@ fn format_json<T: Serialize>(resp: &IpcResponse<T>) -> String {
         format!("{{\"ok\":false,\"error\":\"serialization error: {e}\"}}")
     }) + "\n"
 }
-
-/// Parse a request flexibly. Accepts either:
-/// {"cmd":"list","limit":10}
-/// or {"cmd":"list","args":{"limit":10}}
 fn parse_request(line: &str) -> Result<IpcRequest> {
     let v: Value = serde_json::from_str(line)?;
     let obj = v
@@ -128,12 +114,10 @@ fn parse_request(line: &str) -> Result<IpcRequest> {
         .ok_or_else(|| anyhow!("cmd must be a string"))?
         .to_lowercase();
 
-    // Support optional args object.
     let args_obj = obj
         .get("args")
         .and_then(|a| a.as_object());
 
-    // Helper to pull a field from args or top-level.
     let get = |key: &str| -> Option<&Value> {
         args_obj
             .and_then(|m| m.get(key))
@@ -332,7 +316,6 @@ async fn list_items(conn: &Arc<Mutex<rusqlite::Connection>>, limit: u32, starred
                 let has_image: i64 = row.get(8)?;
                 let hash: Option<String> = row.get(7)?;
                 
-                // Build thumbnail path for images
                 let thumbnail_path = if has_image != 0 && hash.is_some() {
                     let thumbs_dir = crate::db::default_data_dir()
                         .map(|d| d.join("images/thumbs"))
@@ -382,7 +365,6 @@ async fn search_items(conn: &Arc<Mutex<rusqlite::Connection>>, query: &str, limi
                 let has_image: i64 = row.get(8)?;
                 let hash: Option<String> = row.get(7)?;
                 
-                // Build thumbnail path for images
                 let thumbnail_path = if has_image != 0 && hash.is_some() {
                     let thumbs_dir = crate::db::default_data_dir()
                         .map(|d| d.join("images/thumbs"))
@@ -412,16 +394,6 @@ async fn search_items(conn: &Arc<Mutex<rusqlite::Connection>>, query: &str, limi
     .await?
 }
 
-/// Convert a user search string into an FTS5-compatible prefix query.
-///
-/// Example:
-/// - input:  "hel wor"
-/// - output: "hel* wor*"
-///
-/// Notes:
-/// - We intentionally avoid passing through FTS operators or quotes from user input.
-/// - Only ASCII letter/digit/underscore/hyphen are kept; everything else becomes a separator.
-/// - Empty/too-short queries result in an empty string (caller can treat as "no search").
 fn build_fts_prefix_query(input: &str) -> String {
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -439,7 +411,6 @@ fn build_fts_prefix_query(input: &str) -> String {
         tokens.push(current);
     }
 
-    // Avoid generating a massive MATCH string.
     if tokens.len() > 12 {
         tokens.truncate(12);
     }
@@ -470,7 +441,6 @@ async fn gallery_items(conn: &Arc<Mutex<rusqlite::Connection>>, limit: u32) -> R
                 let id: i64 = row.get(0)?;
                 let hash: Option<String> = row.get(7)?;
                 
-                // Build thumbnail path for images (always present in gallery)
                 let thumbnail_path = if hash.is_some() {
                     let thumbs_dir = crate::db::default_data_dir()
                         .map(|d| d.join("images/thumbs"))
@@ -514,7 +484,6 @@ async fn star_item(conn: &Arc<Mutex<rusqlite::Connection>>, id: i64, value: bool
 }
 
 async fn copy_to_clipboard(conn: &Arc<Mutex<rusqlite::Connection>>, id: i64) -> Result<()> {
-    // Check if wl-copy is available
     if let Err(_) = tokio::process::Command::new("which")
         .arg("wl-copy")
         .output()
@@ -523,12 +492,10 @@ async fn copy_to_clipboard(conn: &Arc<Mutex<rusqlite::Connection>>, id: i64) -> 
         return Err(anyhow!("wl-copy not found - install wl-clipboard package"));
     }
 
-    // Fetch item and possible image bytes.
     let conn = conn.clone();
     let item = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
 
-        // Try image first.
         let image_row: Option<(String, Vec<u8>)> = conn
             .query_row(
                 "SELECT mime, bytes FROM images WHERE item_id = ? LIMIT 1",
@@ -541,7 +508,6 @@ async fn copy_to_clipboard(conn: &Arc<Mutex<rusqlite::Connection>>, id: i64) -> 
             return Ok(CopyPayload::Image { mime, bytes });
         }
 
-        // Fallback to text.
         let text: Option<String> = conn
             .query_row(
                 "SELECT body FROM items WHERE id = ?",
@@ -621,10 +587,8 @@ async fn delete_items(conn: &Arc<Mutex<rusqlite::Connection>>, ids: Vec<i64>) ->
 
         let tx = conn.unchecked_transaction()?;
 
-        // Collect hashes for items that will be deleted (for thumbnail cleanup).
         let mut hashes: Vec<String> = Vec::new();
         {
-            // Use a placeholder for each ID in the IN clause.
             let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT hash FROM items WHERE id IN ({}) AND starred = 0 AND hash IS NOT NULL",
@@ -640,7 +604,6 @@ async fn delete_items(conn: &Arc<Mutex<rusqlite::Connection>>, ids: Vec<i64>) ->
             }
         }
 
-        // Delete images for the specified items (only unstarred ones).
         let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
         let sql_del_imgs = format!(
             "DELETE FROM images WHERE item_id IN (SELECT id FROM items WHERE id IN ({}) AND starred = 0)",
@@ -648,7 +611,6 @@ async fn delete_items(conn: &Arc<Mutex<rusqlite::Connection>>, ids: Vec<i64>) ->
         );
         tx.execute(&sql_del_imgs, rusqlite::params_from_iter(ids.iter()))?;
 
-        // Delete the items themselves (only unstarred ones).
         let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
         let sql_del_items = format!(
             "DELETE FROM items WHERE id IN ({}) AND starred = 0",
@@ -658,8 +620,6 @@ async fn delete_items(conn: &Arc<Mutex<rusqlite::Connection>>, ids: Vec<i64>) ->
 
         tx.commit()?;
 
-        // Best-effort file cleanup outside the transaction.
-        // Stored thumbnails follow: ~/.local/share/memoria/images/thumbs/<hash>.png
         if let Ok(data_dir) = crate::db::default_data_dir() {
             let thumbs_dir = data_dir.join("images/thumbs");
             for hash in hashes {
@@ -679,8 +639,6 @@ async fn delete_all_except_starred(conn: &Arc<Mutex<rusqlite::Connection>>) -> R
         let conn = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
 
         let tx = conn.unchecked_transaction()?;
-
-        // Collect hashes for items that are about to be deleted (so we can remove thumbnails).
         let mut hashes: Vec<String> = Vec::new();
         {
             let mut stmt = tx.prepare("SELECT hash FROM items WHERE starred = 0 AND hash IS NOT NULL")?;
@@ -690,19 +648,14 @@ async fn delete_all_except_starred(conn: &Arc<Mutex<rusqlite::Connection>>) -> R
             }
         }
 
-        // Delete images for non-starred items first.
         let deleted_images = tx.execute(
             "DELETE FROM images WHERE item_id IN (SELECT id FROM items WHERE starred = 0)",
             [],
         )? as u64;
-
-        // Delete the items themselves (images table has ON DELETE CASCADE too, but we already removed rows).
         let deleted_items = tx.execute("DELETE FROM items WHERE starred = 0", [])? as u64;
 
         tx.commit()?;
 
-        // Best-effort file cleanup outside the transaction.
-        // Stored thumbnails currently follow: ~/.local/share/memoria/images/thumbs/<hash>.png
         if let Ok(data_dir) = crate::db::default_data_dir() {
             let thumbs_dir = data_dir.join("images/thumbs");
             for hash in hashes {

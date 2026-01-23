@@ -123,7 +123,6 @@ void IpcClient::deleteAllExceptStarred()
 
 void IpcClient::deleteMultiple(const QList<qint64> &ids)
 {
-    // No dedicated pending state needed; we will detect response by key
     QJsonObject req;
     req["cmd"] = "delete_items";
     QJsonObject args;

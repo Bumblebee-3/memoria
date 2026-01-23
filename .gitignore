@@ -1,6 +1,4 @@
 memoria-daemon/target/
 memoria-ui/build/
-memoria.code-workspace
-uninstall.sh
 memoria/
-pkg
+pkg/
