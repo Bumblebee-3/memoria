@@ -515,8 +515,10 @@ ApplicationWindow {
             if (getSelectedCount() > 0) {
                 let firstId = parseInt(Object.keys(selectedIds)[0])
                 ipcClient.copy(firstId)
+                Qt.quit()
             } else {
                 ipcClient.copy(listModel.get(contentList.currentIndex).clipId)
+                Qt.quit()
             }
         }
     }
@@ -529,8 +531,10 @@ ApplicationWindow {
             if (getSelectedCount() > 0) {
                 let firstId = parseInt(Object.keys(selectedIds)[0])
                 ipcClient.copy(firstId)
+                Qt.quit()
             } else {
                 ipcClient.copy(galleryModel.get(contentGrid.currentIndex).clipId)
+                Qt.quit()
             }
         }
     }
